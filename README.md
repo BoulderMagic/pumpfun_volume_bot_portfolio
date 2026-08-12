@@ -97,6 +97,10 @@ Then you can edit the `index.ts` file to create new wallets, distribute & collec
    npm start
    ```
 
+## Notes
+
+- [ICP (Internet Computer Protocol) learning notes](docs/icp.md) — background reference on canisters, cycles, and Chain Fusion, unrelated to this bot's Solana runtime.
+
 ## Author
 - [Github](https://github.com/btcoin23)
 - [Telegram](https://t.me/BTC0in23)
