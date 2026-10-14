@@ -38,11 +38,12 @@ const num = (v, d) => (v === undefined || v === '' || Number.isNaN(Number(v)) ? 
 function resolveUrls() {
   const key = env('ALCHEMY_API_KEY', 'ALCHEMY_KEY');
   let httpUrl = env('POLYGON_HTTP_URL', 'ALCHEMY_HTTP_URL', 'ALCHEMY_POLYGON_URL', 'ALCHEMY_URL', 'POLYGON_RPC_URL', 'RPC_URL', 'HTTP_RPC_URL');
-  let wsUrl = env('POLYGON_WS_URL', 'ALCHEMY_WS_URL', 'ALCHEMY_POLYGON_WS', 'WS_URL', 'WSS_URL', 'WS_RPC_URL');
+  let wsUrl = env('POLYGON_WS_URL', 'POLYGON_WSS_URL', 'ALCHEMY_WS_URL', 'ALCHEMY_POLYGON_WS', 'WS_URL', 'WSS_URL', 'WS_RPC_URL');
   if (!httpUrl && key) httpUrl = `https://polygon-mainnet.g.alchemy.com/v2/${key}`;
   if (httpUrl && httpUrl.startsWith('ws')) { wsUrl ??= httpUrl; httpUrl = httpUrl.replace(/^ws/, 'http'); }
   if (!wsUrl && key) wsUrl = `wss://polygon-mainnet.g.alchemy.com/v2/${key}`;
   if (!wsUrl && httpUrl && /alchemy\.com/.test(httpUrl)) wsUrl = httpUrl.replace(/^https?/, 'wss');
+  if (wsUrl && /^https?:/.test(wsUrl)) wsUrl = wsUrl.replace(/^http/, 'ws'); // e.g. POLYGON_WSS_URL=https://...alchemy...
   return { httpUrl, wsUrl };
 }
 
@@ -786,9 +787,11 @@ function findJsonl(targets) {
 }
 
 function guessContractFromFile(file) {
-  const f = path.basename(file).toLowerCase();
-  if (/managed|moo/.test(f)) return 'managed';
-  if (/standard|std/.test(f)) return 'standard';
+  // file name first, then its folder (e.g. data/managed-live/2026-10-01.jsonl, data/public-live/...)
+  for (const part of [path.basename(file), path.basename(path.dirname(file))].map((x) => x.toLowerCase())) {
+    if (/managed|moo/.test(part)) return 'managed';
+    if (/standard|std|public/.test(part)) return 'standard';
+  }
   return 'unknown';
 }
 
