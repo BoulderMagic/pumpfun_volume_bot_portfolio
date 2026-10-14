@@ -13,6 +13,7 @@
 //   node v2.mjs sync                        catch up to the confirmed head once, then exit
 //   node v2.mjs backfill --from N [--to M]  rescan a block range (fills gaps, does not move checkpoints)
 //   node v2.mjs whitelist [--limit N]       snapshot default whitelist + check open managed requests
+//   node v2.mjs attempts [--from N] [--reasons N]  competition tracker: every direct proposePrice tx, incl. reverted (Etherscan)
 //   node v2.mjs report                      print statistics
 //   node v2.mjs dashboard [--port 8787]     local web dashboard (http://127.0.0.1:8787)
 //   node v2.mjs label <address> <label>     attach a label to a wallet
@@ -60,6 +61,7 @@ const CFG = {
   whitelistRefreshMin: num(env('V2_WHITELIST_REFRESH_MIN'), 60),
   whitelistChecksPerCycle: num(env('V2_WHITELIST_CHECKS_PER_CYCLE'), 5),
   dashboardPort: num(env('V2_DASHBOARD_PORT'), 8787),
+  attemptsIntervalMin: num(env('V2_ATTEMPTS_INTERVAL_MIN'), 5),
 };
 
 // Estimated Alchemy compute units per method. eth_getLogs uses our working estimate of 60.
@@ -891,6 +893,11 @@ async function cmdSync(store, { live }) {
   store.loadDefaultWhitelist();
 
   let stream = null;
+  let attempts = null, lastAttempts = 0;
+  if (live && env('ETHERSCAN_API_KEY', 'POLYGONSCAN_API_KEY')) {
+    attempts = new AttemptTracker(store, new EtherscanClient(store), rpc);
+    log(`Competition tracker on: Etherscan txlist every ${CFG.attemptsIntervalMin} min`);
+  } else if (live) log('Competition tracker off (set ETHERSCAN_API_KEY to track failed proposal transactions).');
   const stop = () => { if (syncer.stopped) process.exit(1); syncer.stopped = true; stream?.stop(); log('Stopping after the current batch… (Ctrl+C again to force)'); };
   process.on('SIGINT', stop); process.on('SIGTERM', stop);
 
@@ -931,6 +938,10 @@ async function cmdSync(store, { live }) {
         if (r) log(`whitelist ${short(k.split(':')[1])}: ${r.enforced ? `enforced, ${r.count} proposers${r.custom ? ' (custom list)' : ''}` : 'NOT enforced (public)'}`);
       }
       if (budget > 0 && !syncer.stopped) await wl.checkOpenRequests(budget);
+      if (attempts && !syncer.stopped && Date.now() - lastAttempts > CFG.attemptsIntervalMin * 60000) {
+        lastAttempts = Date.now();
+        try { await attempts.sync({ label: 'attempts' }); } catch (e) { log(`Attempt tracking error: ${e.message}`); }
+      }
     } catch (e) {
       log(`Cycle error: ${e.message}`);
     }
@@ -968,6 +979,299 @@ async function cmdWhitelist(store, args) {
 }
 
 function argVal(args, name) { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; }
+
+// ───────────────────────────────────────────────────────────── competition tracker (failed + winning proposal transactions)
+//
+// Event logs only show the winning proposal. Etherscan's txlist for each oracle address also returns
+// reverted transactions, so every *direct* proposePrice call (winner or loser) can be matched to its request.
+// Attempts routed through a bot's own contract are not visible this way; the report shows how many winning
+// proposals arrived as direct calls ("direct-call coverage") so the blind spot is measured, not guessed.
+
+const OO_FNS = new Interface([
+  'function proposePrice(address requester, bytes32 identifier, uint256 timestamp, bytes ancillaryData, int256 proposedPrice) returns (uint256)',
+  'function proposePriceFor(address proposer, address requester, bytes32 identifier, uint256 timestamp, bytes ancillaryData, int256 proposedPrice) returns (uint256)',
+  'function disputePrice(address requester, bytes32 identifier, uint256 timestamp, bytes ancillaryData) returns (uint256)',
+  'function disputePriceFor(address disputer, address requester, bytes32 identifier, uint256 timestamp, bytes ancillaryData) returns (uint256)',
+  'function multicall(bytes[] data) returns (bytes[])',
+]);
+
+const ATTEMPT_COLUMNS = {
+  function_name: 'TEXT', kind: 'TEXT', proposer: 'TEXT', tx_index: 'INTEGER', block_time: 'INTEGER',
+  gas_limit: 'TEXT', gas_price: 'TEXT', proposed_price: 'TEXT', classification: 'TEXT',
+  winner_tx: 'TEXT', blocks_after_winner: 'INTEGER',
+};
+
+function migrateAttempts(db) {
+  const have = new Set(db.prepare('PRAGMA table_info(transaction_attempts)').all().map((c) => c.name));
+  for (const [col, type] of Object.entries(ATTEMPT_COLUMNS)) if (!have.has(col)) db.exec(`ALTER TABLE transaction_attempts ADD COLUMN ${col} ${type}`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_attempts_request ON transaction_attempts(request_key);
+    CREATE INDEX IF NOT EXISTS idx_attempts_from ON transaction_attempts(from_address);`);
+}
+
+class EtherscanClient {
+  constructor(store) {
+    this.key = env('ETHERSCAN_API_KEY', 'POLYGONSCAN_API_KEY');
+    if (!this.key) throw new Error('Set ETHERSCAN_API_KEY in .env (free key from etherscan.io; one key covers Polygon via the V2 API).');
+    this.url = env('V2_ETHERSCAN_URL') ?? 'https://api.etherscan.io/v2/api';
+    this.chainId = env('V2_CHAIN_ID') ?? '137';
+    this.minGap = 1000 / num(env('V2_ETHERSCAN_RPS'), 4);
+    this.last = 0; this.chain = Promise.resolve(); this.store = store;
+  }
+  call(params) {
+    const p = this.chain.then(() => this.#exec(params));
+    this.chain = p.catch(() => {});
+    return p;
+  }
+  async #exec(params) {
+    const qs = new URLSearchParams({ chainid: this.chainId, ...params, apikey: this.key });
+    const method = `etherscan:${params.action}`;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const wait = this.last + this.minGap - Date.now();
+      if (wait > 0) await sleep(wait);
+      this.last = Date.now();
+      const t0 = performance.now();
+      try {
+        const res = await fetch(`${this.url}?${qs}`, { signal: AbortSignal.timeout(30000) });
+        const body = await res.json();
+        const ms = performance.now() - t0;
+        if (body.status === '1') { this.store.recordMetric(method, ms, true, null, 0); return body.result; }
+        if (/no transactions found|no records found/i.test(body.message ?? '') || (Array.isArray(body.result) && body.result.length === 0)) { this.store.recordMetric(method, ms, true, null, 0); return []; }
+        const msg = typeof body.result === 'string' ? body.result : body.message;
+        this.store.recordMetric(method, ms, false, msg, 0);
+        if (/rate limit/i.test(msg ?? '')) { await sleep(1000 * 2 ** attempt); continue; }
+        throw new Error(`Etherscan: ${msg}`);
+      } catch (e) {
+        if (e.message.startsWith('Etherscan:')) throw e;
+        this.store.recordMetric(method, performance.now() - t0, false, e.message, 0);
+        if (attempt === 5) throw e;
+        await sleep(1000 * 2 ** attempt);
+      }
+    }
+    throw new Error('Etherscan: rate limited too many times');
+  }
+  // All transactions *to* an address in [from, to], ascending. Pages by advancing startblock (the API caps page*offset at 10,000).
+  async *txlist(address, from, to) {
+    const PAGE = 1000;
+    let start = from;
+    const seen = new Set();
+    for (;;) {
+      const rows = await this.call({ module: 'account', action: 'txlist', address, startblock: String(start), endblock: String(to), page: '1', offset: String(PAGE), sort: 'asc' });
+      const fresh = rows.filter((r) => !seen.has(r.hash));
+      for (const r of fresh) seen.add(r.hash);
+      if (fresh.length) yield fresh;
+      if (rows.length < PAGE) return;
+      const lastBlock = Number(rows.at(-1).blockNumber);
+      if (lastBlock === start && !fresh.length) { log(`Etherscan: more than ${PAGE} txs in block ${start}; some may be skipped`); start++; }
+      else start = lastBlock; // re-read the last block (dedupe by hash) so nothing in it is lost
+      if (seen.size > 50000) seen.clear();
+    }
+  }
+}
+
+// Decodes a direct oracle call into zero or more attempt records (multicall can bundle several).
+function decodeAttemptCalls(contractKey, input) {
+  let parsed;
+  try { parsed = OO_FNS.parseTransaction({ data: input }); } catch { return []; }
+  if (!parsed) return [];
+  if (parsed.name === 'multicall') return parsed.args[0].flatMap((d) => decodeAttemptCalls(contractKey, d));
+  const a = argsToPlain(parsed.fragment, parsed.args);
+  const kind = parsed.name.startsWith('propose') ? 'propose' : 'dispute';
+  const requestId = requestIdOf(a.requester, a.identifier, a.timestamp, a.ancillaryData);
+  return [{
+    function_name: parsed.name, kind, request_key: `${contractKey}:${requestId}`,
+    proposer: a.proposer ?? null, proposed_price: a.proposedPrice != null ? String(a.proposedPrice) : null,
+    requester: a.requester, identifier: a.identifier, timestamp: a.timestamp, ancillary: a.ancillaryData,
+  }];
+}
+
+class AttemptTracker {
+  constructor(store, scan, rpc) {
+    this.store = store; this.scan = scan; this.rpc = rpc;
+    migrateAttempts(store.db);
+    const db = store.db;
+    this.q = {
+      upsert: db.prepare(`INSERT INTO transaction_attempts (tx_hash, request_key, contract, from_address, block_number, status, gas_used, revert_reason, detected_at, source,
+          function_name, kind, proposer, tx_index, block_time, gas_limit, gas_price, proposed_price)
+        VALUES (?,?,?,?,?,?,?,NULL,?,'etherscan',?,?,?,?,?,?,?,?)
+        ON CONFLICT(tx_hash) DO UPDATE SET status = excluded.status, gas_used = excluded.gas_used, block_number = excluded.block_number, tx_index = excluded.tx_index`),
+      forRequest: db.prepare('SELECT * FROM transaction_attempts WHERE request_key = ? ORDER BY block_number, tx_index'),
+      winner: db.prepare('SELECT event_id, tx_hash, block_number FROM proposals WHERE request_key = ? ORDER BY block_number LIMIT 1'),
+      setClass: db.prepare('UPDATE transaction_attempts SET classification = ?, winner_tx = ?, blocks_after_winner = ? WHERE tx_hash = ?'),
+      setReason: db.prepare('UPDATE transaction_attempts SET revert_reason = ? WHERE tx_hash = ?'),
+    };
+  }
+
+  // Ingest one page of Etherscan rows for a contract.
+  ingest(contract, rows) {
+    return tx(this.store.db, () => {
+      const keys = new Set();
+      let n = 0;
+      for (const r of rows) {
+        if (lc(r.to) !== contract.address) continue;
+        const calls = decodeAttemptCalls(contract.key, r.input);
+        if (!calls.length) continue;
+        const status = r.isError === '1' || r.txreceipt_status === '0' ? 'reverted' : 'success';
+        // A multicall with several proposals shares one tx hash; store the first, it is the one that decides the race.
+        const c = calls[0];
+        this.q.upsert.run(lc(r.hash), c.request_key, contract.key, lc(r.from), Number(r.blockNumber), status, r.gasUsed ?? null, nowSec(),
+          c.function_name, c.kind, c.proposer ? lc(c.proposer) : lc(r.from), Number(r.transactionIndex), Number(r.timeStamp), r.gas ?? null, r.gasPrice ?? null, c.proposed_price);
+        keys.add(c.request_key); n++;
+      }
+      for (const k of keys) this.classify(k);
+      return { attempts: n, requests: keys.size };
+    });
+  }
+
+  // Labels each attempt on a request relative to the accepted proposal (from the ProposePrice event).
+  classify(key) {
+    const attempts = this.q.forRequest.all(key);
+    const win = this.q.winner.get(key);
+    const winTx = win?.tx_hash ?? attempts.find((a) => a.kind === 'propose' && a.status === 'success')?.tx_hash ?? null;
+    const winAttempt = attempts.find((a) => a.tx_hash === winTx);
+    const winBlock = win?.block_number ?? winAttempt?.block_number ?? null;
+    const req = this.store.db.prepare('SELECT contract, status FROM requests WHERE request_key = ?').get(key);
+    const wl = req?.contract === 'managed' ? (this.store.q.latestRequestWl.get(key) ?? null) : null;
+    const wlSet = wl ? (wl.enforced ? new Set(wl.addresses_json ? JSON.parse(wl.addresses_json) : [...(this.store.defaultWl?.addresses ?? [])]) : null)
+      : req?.contract === 'managed' && this.store.defaultWl ? this.store.defaultWl.addresses : null;
+    for (const a of attempts) {
+      let cls;
+      const after = winBlock != null && a.block_number != null ? a.block_number - winBlock : null;
+      if (a.kind === 'dispute') cls = a.status === 'success' ? 'dispute' : 'dispute_failed';
+      else if (a.tx_hash === winTx) cls = 'won';
+      else if (a.status === 'success') cls = 'success_unmatched'; // success without a matching event (e.g. not yet synced)
+      else if (a.gas_used && a.gas_limit && Number(a.gas_used) >= 0.97 * Number(a.gas_limit)) cls = 'out_of_gas';
+      else if (winBlock != null && after > 0) cls = 'lost_late';
+      else if (winBlock != null && after === 0) cls = winAttempt?.tx_index != null && a.tx_index < winAttempt.tx_index ? 'failed_before_winner' : 'lost_same_block';
+      else if (wlSet && !wlSet.has(a.proposer)) cls = 'not_whitelisted';
+      else if (!req) cls = 'unknown_request';
+      else cls = 'failed_other';
+      this.q.setClass.run(cls, winTx, after, a.tx_hash);
+    }
+  }
+
+  async sync({ from, to, label = 'attempts' } = {}) {
+    const head = await this.rpc.blockNumber();
+    const end = Math.min(to ?? head - CFG.confirmations, head - CFG.confirmations);
+    const total = { attempts: 0, requests: 0 };
+    for (const c of CONTRACTS) {
+      const cpKey = `attempts:${c.key}`;
+      let start = from;
+      if (start == null) {
+        const cp = this.store.checkpoint(cpKey);
+        start = cp != null ? cp + 1
+          : this.store.db.prepare('SELECT MIN(block_number) AS b FROM oracle_events WHERE contract = ? AND block_number IS NOT NULL').get(c.key).b
+            ?? CFG.startBlock ?? head - CFG.defaultLookback;
+      }
+      if (start > end) continue;
+      log(`${label} ${c.name}: blocks ${start}-${end} via Etherscan`);
+      for await (const rows of this.scan.txlist(c.address, start, end)) {
+        const s = this.ingest(c, rows);
+        total.attempts += s.attempts; total.requests += s.requests;
+        if (s.attempts) log(`${label} ${c.key}: +${s.attempts} proposal/dispute txs up to block ${rows.at(-1).blockNumber}`);
+      }
+      if (from == null || to == null) this.store.setCheckpoint(cpKey, end);
+    }
+    return total;
+  }
+
+  // Re-classify everything (e.g. after new ProposePrice events or whitelist snapshots arrive).
+  reclassifyAll() {
+    const keys = this.store.db.prepare('SELECT DISTINCT request_key FROM transaction_attempts').all();
+    tx(this.store.db, () => { for (const r of keys) this.classify(r.request_key); });
+    return keys.length;
+  }
+
+  // Optional: replay failed attempts with eth_call at the previous block to read the revert reason.
+  // If the replay succeeds, the call was valid before the block, so it most likely lost to a tx in the same block.
+  async reasons(limit) {
+    const rows = this.store.db.prepare(`SELECT a.tx_hash, a.from_address, a.block_number, a.contract FROM transaction_attempts a
+      WHERE a.status = 'reverted' AND a.revert_reason IS NULL AND a.classification IN ('failed_other','lost_same_block','failed_before_winner','not_whitelisted','unknown_request')
+      ORDER BY a.block_number DESC LIMIT ?`).all(limit);
+    let n = 0;
+    for (const r of rows) {
+      const t = await this.rpc.call('eth_getTransactionByHash', [r.tx_hash]);
+      if (!t) continue;
+      let reason;
+      try {
+        await this.rpc.call('eth_call', [{ from: r.from_address, to: t.to, data: t.input, gas: t.gas }, '0x' + (r.block_number - 1).toString(16)]);
+        reason = 'replay OK at previous block (lost to a same-block tx)';
+      } catch (e) { reason = e.message.replace(/^execution reverted:?\s*/i, '').slice(0, 200) || 'reverted (no reason)'; }
+      this.q.setReason.run(reason, r.tx_hash); n++;
+    }
+    return n;
+  }
+}
+
+async function cmdAttempts(store, args) {
+  const rpc = new RpcClient(CFG.httpUrl, store);
+  const tracker = new AttemptTracker(store, new EtherscanClient(store), rpc);
+  const from = argVal(args, '--from'), to = argVal(args, '--to');
+  const t = await tracker.sync({ from: from != null ? Number(from) : undefined, to: to != null ? Number(to) : undefined });
+  log(`Done: ${t.attempts} proposal/dispute transactions across ${t.requests} requests.`);
+  log(`Reclassified ${tracker.reclassifyAll()} requests.`);
+  const r = argVal(args, '--reasons');
+  if (r) log(`Read revert reasons for ${await tracker.reasons(Number(r))} failed attempts.`);
+}
+
+function competitionAnalysis(db) {
+  migrateAttempts(db);
+  const all = (sql, ...p) => db.prepare(sql).all(...p);
+  const get = (sql, ...p) => db.prepare(sql).get(...p);
+  // wallets = distinct proposers seen in direct txs, plus the accepted proposer when it arrived via a contract (not in txlist)
+  const perRequest = `SELECT a.request_key, r.contract, r.title, COUNT(*) AS txs,
+      COUNT(DISTINCT a.proposer) + (SELECT COUNT(*) FROM proposals p WHERE p.request_key = a.request_key AND p.block_number = (SELECT MIN(block_number) FROM proposals p2 WHERE p2.request_key = a.request_key)
+        AND NOT EXISTS (SELECT 1 FROM transaction_attempts x WHERE x.request_key = a.request_key AND x.proposer = p.proposer)) AS wallets,
+      SUM(a.status = 'reverted') AS failed, SUM(a.classification = 'lost_same_block') AS same_block,
+      MIN(a.block_number) AS first_block, MAX(a.classification = 'won') AS has_winner
+    FROM transaction_attempts a LEFT JOIN requests r ON r.request_key = a.request_key
+    WHERE a.kind = 'propose' GROUP BY a.request_key`;
+  return {
+    summary: () => {
+      const s = get(`SELECT COUNT(*) AS requests, SUM(wallets) AS wallet_slots, ROUND(AVG(wallets), 2) AS avg_wallets, MAX(wallets) AS max_wallets,
+          SUM(wallets > 1) AS contested, SUM(failed) AS failed_txs, SUM(same_block > 0) AS same_block_races FROM (${perRequest})`);
+      const cov = get(`SELECT COUNT(*) AS proposals, SUM(EXISTS (SELECT 1 FROM transaction_attempts a WHERE a.tx_hash = p.tx_hash)) AS direct
+        FROM proposals p WHERE p.block_number >= COALESCE((SELECT MIN(block_number) FROM transaction_attempts), 1e18)`);
+      const classes = all(`SELECT classification, COUNT(*) AS txs, COUNT(DISTINCT proposer) AS wallets FROM transaction_attempts GROUP BY classification ORDER BY txs DESC`);
+      const ws = all(`SELECT wallets, COUNT(*) AS requests FROM (${perRequest}) GROUP BY wallets ORDER BY wallets`);
+      const median = (() => { const v = ws.flatMap((r) => Array(r.requests).fill(r.wallets)); return v.length ? v[Math.floor((v.length - 1) / 2)] : null; })();
+      const buckets = [['1', 1, 1], ['2', 2, 2], ['3-5', 3, 5], ['6-10', 6, 10], ['11-20', 11, 20], ['21+', 21, 1e9]]
+        .map(([b, lo, hi]) => ({ wallets_per_request: b, requests: ws.filter((r) => r.wallets >= lo && r.wallets <= hi).reduce((x, r) => x + r.requests, 0) }));
+      return { ...s, median_wallets: median, coverage: cov, classes, buckets };
+    },
+    wallets: (limit = 50) => all(`SELECT a.proposer AS wallet, COALESCE(l.label, '') AS label, COUNT(*) AS attempts, COUNT(DISTINCT a.request_key) AS requests,
+        SUM(a.classification = 'won') AS won, SUM(a.classification IN ('lost_same_block','lost_late')) AS lost_race,
+        SUM(a.classification = 'lost_same_block') AS lost_same_block, SUM(a.classification = 'not_whitelisted') AS not_whitelisted,
+        SUM(a.classification IN ('failed_other','out_of_gas','failed_before_winner','unknown_request')) AS other_failed,
+        ROUND(100.0 * SUM(a.classification = 'won') / COUNT(DISTINCT a.request_key), 1) AS win_pct,
+        ROUND(AVG(CAST(a.gas_price AS REAL)) / 1e9, 1) AS avg_gwei, COUNT(DISTINCT a.from_address) AS senders, MAX(a.block_number) AS last_block
+      FROM transaction_attempts a LEFT JOIN wallet_labels l ON l.address = a.proposer
+      WHERE a.kind = 'propose' GROUP BY a.proposer ORDER BY attempts DESC LIMIT ?`, limit),
+    contested: (limit = 25) => all(`SELECT * FROM (${perRequest}) WHERE wallets > 1 ORDER BY wallets DESC, first_block DESC LIMIT ?`, limit),
+    gas: () => get(`SELECT ROUND(AVG(CASE WHEN w.gas_price IS NOT NULL THEN CAST(w.gas_price AS REAL) / CAST(l.gas_price AS REAL) END), 2) AS winner_vs_loser_gas_ratio,
+        SUM(CAST(w.gas_price AS REAL) > CAST(l.gas_price AS REAL)) AS winner_paid_more, SUM(CAST(w.gas_price AS REAL) <= CAST(l.gas_price AS REAL)) AS winner_paid_same_or_less
+      FROM transaction_attempts l JOIN transaction_attempts w ON w.tx_hash = l.winner_tx
+      WHERE l.classification = 'lost_same_block'`),
+  };
+}
+
+function printCompetition(db) {
+  const c = competitionAnalysis(db);
+  const s = c.summary();
+  console.log('\n=== Competition (direct proposePrice transactions, including reverted) ===');
+  if (!s.requests) { console.log('No attempt data yet. Run: node v2.mjs attempts   (needs ETHERSCAN_API_KEY)'); return; }
+  console.log(`Requests with attempts: ${s.requests} | contested (2+ wallets): ${s.contested} | wallets per request: median ${s.median_wallets}, avg ${s.avg_wallets}, max ${s.max_wallets}`);
+  console.log(`Failed proposal txs: ${s.failed_txs} | requests with a same-block race: ${s.same_block_races}`);
+  const cov = s.coverage;
+  if (cov?.proposals) console.log(`Direct-call coverage: ${cov.direct}/${cov.proposals} accepted proposals (${Math.round((100 * cov.direct) / cov.proposals)}%) were direct oracle calls. Bots using their own contracts are invisible here, so counts are a LOWER BOUND.`);
+  console.table(s.buckets);
+  console.table(s.classes);
+  console.log('Wallets by attempts:');
+  console.table(c.wallets(25));
+  console.log('Most contested requests:');
+  console.table(c.contested(10).map((r) => ({ contract: r.contract, block: r.first_block, wallets: r.wallets, txs: r.txs, failed: r.failed, title: (r.title ?? r.request_key).slice(0, 60) })));
+  const g = c.gas();
+  if (g?.winner_vs_loser_gas_ratio != null) console.log(`Same-block races: winner/loser gas price ratio ${g.winner_vs_loser_gas_ratio}; winner paid more in ${g.winner_paid_more}, same or less in ${g.winner_paid_same_or_less}.`);
+}
 
 // ───────────────────────────────────────────────────────────── analysis queries (report + dashboard)
 
@@ -1078,7 +1382,7 @@ function cmdReport(store) {
   h('RPC usage (last 60 minutes, estimated CUs)');
   const rpc = a.rpc(60);
   rpc.length ? console.table(rpc) : console.log('(no RPC calls recorded in the last hour)');
-  console.log(`\ntransaction_attempts rows: ${a.attempts()} (filled by the V2.1 transaction-analysis component)`);
+  printCompetition(store.db);
 }
 
 // ───────────────────────────────────────────────────────────── dashboard
@@ -1094,6 +1398,7 @@ function cmdDashboard(store, args) {
     '/api/proposals': () => a.recentProposals(100).map((r) => ({ ...r, proposed_price: fmtPrice(r.proposed_price) })),
     '/api/whitelist': () => a.whitelist(),
     '/api/rpc': () => a.rpc(60),
+    '/api/competition': () => { const c = competitionAnalysis(store.db); return { summary: c.summary(), wallets: c.wallets(100), contested: c.contested(50), gas: c.gas() }; },
   };
   http.createServer((req, res) => {
     const url = new URL(req.url, 'http://x');
@@ -1124,7 +1429,7 @@ h2{font-size:15px;margin:18px 0 8px}
 <header><h1>UMA Oracle Competition Monitor</h1><small id="gen">loading…</small><small>read-only · Polygon · Standard + Managed OOV2</small></header>
 <nav id="tabs"></nav><main id="view"></main>
 <script>
-const tabs={overview:'Overview',opportunities:'Public opportunities',proposers:'Wallet rankings',proposals:'Accepted proposals',whitelist:'Whitelist',rpc:'RPC usage'};
+const tabs={overview:'Overview',opportunities:'Public opportunities',proposers:'Wallet rankings',proposals:'Accepted proposals',competition:'Competition',whitelist:'Whitelist',rpc:'RPC usage'};
 let cur=new URLSearchParams(location.hash.slice(1)).get('t')||'overview';
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const addr=a=>a&&/^0x[0-9a-f]{40}$/i.test(a)?'<code title="'+a+'">'+a.slice(0,6)+'…'+a.slice(-4)+'</code>':esc(a);
@@ -1138,13 +1443,20 @@ async function render(){
  if(cur==='overview'){const s=await j('/api/summary');const tot=(n)=>s.events.filter(e=>e.event_name===n).reduce((a,e)=>a+e.events,0);
   h+='<div class="tiles">'+[['Requests',tot('RequestPrice')],['Proposals',tot('ProposePrice')],['Disputes',tot('DisputePrice')],['Settlements',tot('Settle')],['Unconfirmed',s.events.reduce((a,e)=>a+(e.unconfirmed||0),0)]].map(t=>'<div class="tile"><small>'+t[0]+'</small><b>'+t[1].toLocaleString()+'</b></div>').join('')+'</div>';
   h+='<h2>Requests by status</h2>'+table(s.statuses)+'<h2>Events</h2>'+table(s.events)+'<h2>Checkpoints</h2>'+table(s.checkpoints.map(c=>({...c,updated_at:new Date(c.updated_at*1000).toLocaleString()})));
-  h+='<p><small>transaction_attempts rows: '+s.attempts+' (V2.1 transaction analysis)</small></p>';
   document.getElementById('gen').textContent='updated '+new Date(s.generated_at*1000).toLocaleTimeString();}
  if(cur==='opportunities')h+='<h2>Open requests with no proposal yet</h2>'+table(await j('/api/opportunities'),[['contract','Oracle'],['access','Access'],['requested_block','Block'],['reward','Reward'],['final_fee','Final fee'],['requester','Requester',addr],['title','Market',(v,r)=>esc(v||r.identifier),1]]);
  if(cur==='proposers')h+='<h2>Accepted proposers (by on-chain ProposePrice events)</h2>'+table(await j('/api/proposers'),[['proposer','Wallet',addr],['label','Label'],['proposals','Proposals'],['share_pct','Share %'],['requests','Requests'],['standard','Standard'],['managed','Managed'],['accepted','Settled OK'],['disputes_won','Disp. won'],['disputes_lost','Disp. lost'],['open','Open'],['avg_latency_blocks','Avg latency (blocks)'],['on_whitelist','Whitelisted',yn],['last_block','Last block']])+'<h2>Disputers</h2>'+table(await j('/api/disputers'),[['disputer','Wallet',addr],['label','Label'],['disputes','Disputes'],['proposers_disputed','Proposers disputed'],['last_block','Last block']]);
  if(cur==='proposals')h+='<h2>Most recent proposals</h2>'+table(await j('/api/proposals'),[['block_number','Block'],['contract','Oracle'],['proposer','Proposer',addr],['proposed_price','Price'],['outcome','Outcome'],['latency_blocks','Latency'],['proposer_on_whitelist','Whitelisted',yn],['whitelist_basis','Basis'],['title','Market',esc,1]])+'<p><small>Failed / reverted competing attempts are not visible in events; they will come from the transaction_attempts table (V2.1).</small></p>';
  if(cur==='whitelist'){const w=await j('/api/whitelist');h+=w.snapshot?'<h2>Default proposer whitelist '+addr(w.snapshot.address)+' — '+w.snapshot.count+' addresses</h2>'+table(w.members,[['address','Wallet',addr],['label','Label'],['proposals','Proposals'],['last_block','Last block']]):'<p>No whitelist snapshot yet.</p>';
   h+='<h2>Per-request checks</h2>'+table([w.perRequest||{}]);if(w.outsiders.length)h+='<h2>Managed proposers not on the comparison whitelist</h2>'+table(w.outsiders,[['proposer','Wallet',addr],['proposals','Proposals']]);if(w.lastError)h+='<p class="no">Last snapshot error: '+esc(w.lastError.error)+'</p>';}
+ if(cur==='competition'){const c=await j('/api/competition');const s=c.summary;
+  if(!s.requests)h+='<p>No attempt data yet. Run <code>node v2.mjs attempts</code> (needs ETHERSCAN_API_KEY).</p>';else{
+  h+='<div class="tiles">'+[['Requests tracked',s.requests],['Contested (2+ wallets)',s.contested],['Median wallets / request',s.median_wallets],['Max wallets',s.max_wallets],['Failed proposal txs',s.failed_txs],['Same-block races',s.same_block_races]].map(t=>'<div class="tile"><small>'+t[0]+'</small><b>'+(t[1]??0).toLocaleString()+'</b></div>').join('')+'</div>';
+  if(s.coverage&&s.coverage.proposals)h+='<p><small>Direct-call coverage: '+s.coverage.direct+' of '+s.coverage.proposals+' accepted proposals were direct oracle calls. Bots that propose through their own contracts are not visible, so these counts are a lower bound.</small></p>';
+  h+='<h2>Wallets per request</h2>'+table(s.buckets)+'<h2>Outcomes</h2>'+table(s.classes);
+  h+='<h2>Competing wallets</h2>'+table(c.wallets,[['wallet','Wallet',addr],['label','Label'],['attempts','Attempts'],['requests','Requests'],['won','Won'],['win_pct','Win %'],['lost_race','Lost race'],['lost_same_block','Same block'],['not_whitelisted','Not WL'],['other_failed','Other fail'],['avg_gwei','Avg gwei'],['senders','Senders'],['last_block','Last block']]);
+  h+='<h2>Most contested requests</h2>'+table(c.contested,[['contract','Oracle'],['first_block','Block'],['wallets','Wallets'],['txs','Txs'],['failed','Failed'],['same_block','Same block'],['title','Market',(v,r)=>esc(v||r.request_key),1]]);
+  if(c.gas&&c.gas.winner_vs_loser_gas_ratio!=null)h+='<p><small>Same-block races: winner/loser gas price ratio '+c.gas.winner_vs_loser_gas_ratio+' (winner paid more in '+c.gas.winner_paid_more+', same or less in '+c.gas.winner_paid_same_or_less+').</small></p>';}}
  if(cur==='rpc')h+='<h2>RPC usage — last 60 minutes (estimated CUs)</h2>'+table(await j('/api/rpc'));
  v.innerHTML=h;}
 function go(t){cur=t;location.hash='t='+t;render()}
@@ -1179,6 +1491,7 @@ const HELP = `UMA Monitor V2 (read-only)
   node v2.mjs sync                     catch up once and exit
   node v2.mjs backfill --from N [--to M]
   node v2.mjs whitelist [--limit N]
+  node v2.mjs attempts [--from N] [--to M] [--reasons N]   competition tracker (needs ETHERSCAN_API_KEY)
   node v2.mjs report
   node v2.mjs dashboard [--port 8787]
   node v2.mjs label <address> <label>
@@ -1198,6 +1511,7 @@ async function main() {
       case 'sync': await cmdSync(store, { live: false }); break;
       case 'backfill': await cmdBackfill(store, args); break;
       case 'whitelist': await cmdWhitelist(store, args); break;
+      case 'attempts': await cmdAttempts(store, args); break;
       case 'report': cmdReport(store); break;
       case 'dashboard': cmdDashboard(store, args); return; // keep DB open while serving
       case 'label': cmdLabel(store, args); break;

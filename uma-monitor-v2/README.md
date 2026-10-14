@@ -15,6 +15,7 @@ each oracle request through its lifecycle, plus the wallets competing to answer 
 - Node.js **22.13+** (uses the built-in `node:sqlite`; on older Node run `npm install better-sqlite3` and it is used instead)
 - `ethers` v6 (`npm install ethers` if your project doesn't already have it)
 - An Alchemy key in `.env` (`ALCHEMY_API_KEY=...`, or `POLYGON_HTTP_URL` / `POLYGON_WS_URL`). See `.env.example`.
+- Optional, for the competition tracker: `ETHERSCAN_API_KEY=...` (free key from etherscan.io; one key covers Polygon through the V2 API)
 
 ## Setup in your existing project
 
@@ -41,6 +42,7 @@ each oracle request through its lifecycle, plus the wallets competing to answer 
 | `sync` | Catch up to the confirmed head once and exit |
 | `backfill --from N [--to M]` | Rescan a range (fills gaps between old historical and live files; doesn't move checkpoints) |
 | `whitelist [--limit N]` | Snapshot the default proposer whitelist and check open managed requests |
+| `attempts [--from N] [--to M] [--reasons N]` | Competition tracker: every direct `proposePrice` transaction, including reverted ones (needs `ETHERSCAN_API_KEY`). `--reasons N` replays up to N failed ones to read the revert reason (eth_call on Alchemy) |
 | `report` | Event counts, request statuses, proposer rankings, disputers, open opportunities, whitelist, checkpoints, RPC usage |
 | `dashboard [--port 8787]` | Local read-only web dashboard |
 | `label <address> <label>` | Name a wallet |
@@ -65,6 +67,34 @@ each oracle request through its lifecycle, plus the wallets competing to answer 
   This returns the list that actually applies to that request (custom or default) and whether it is enforced.
   Each proposal records whether its proposer was on that list (`whitelist_basis`: `request`, `default` or `public`).
 
+## Competition tracker
+
+Oracle events only ever show the one accepted proposal per request. The contract rejects every later attempt.
+To see who else tried, `attempts` pulls every transaction sent to each oracle from Etherscan, including reverted ones.
+It decodes `proposePrice`, `proposePriceFor` and `multicall` calls, matches each one to its request, and labels it:
+
+| Label | Meaning |
+|---|---|
+| `won` | The accepted proposal |
+| `lost_same_block` | Reverted in the same block as the winner (a true race) |
+| `lost_late` | Reverted in a later block (the request was already proposed) |
+| `failed_before_winner` | Reverted earlier in the winner's block, so for some other reason |
+| `not_whitelisted` | Managed OOV2 request, proposer not on the whitelist |
+| `out_of_gas` | Used ≥97% of its gas limit |
+| `failed_other` / `unknown_request` | Anything else / no matching request in the DB |
+
+`report` and the dashboard's **Competition** tab show:
+- wallets per request (median, max, and a distribution)
+- each wallet's attempts, wins, lost races and win rate
+- the most contested requests
+- whether same-block winners paid a higher gas price
+
+In `live` mode this runs every 5 minutes (`V2_ATTEMPTS_INTERVAL_MIN`) when the key is set.
+
+**Lower bound.** Only *direct* calls to the oracle are visible. Bots that propose through their own contract, and transactions that never reached the chain, are missed.
+The report prints the **direct-call coverage**: the share of accepted proposals that arrived as direct calls. If it's 60%, roughly 40% of winners, and probably a similar share of losers, use contracts.
+An accepted proposer who used a contract is still counted as one of the wallets on that request.
+
 ## Tables (`data/v2/monitor.sqlite`)
 
 | Table | Contents |
@@ -75,14 +105,14 @@ each oracle request through its lifecycle, plus the wallets competing to answer 
 | `whitelist_snapshots` | Default and per-request whitelist reads |
 | `sync_checkpoints` | Last confirmed block per contract |
 | `rpc_metrics` | Per-minute, per-method call counts, errors, latency and estimated CUs |
-| `transaction_attempts` | Schema only. Filled by the V2.1 transaction-analysis component |
+| `transaction_attempts` | Every direct propose/dispute transaction (winning or reverted): wallet, block, position, gas price, classification, revert reason |
 | `wallet_labels`, `import_log` | Labels and import history |
 
 You can query it directly, e.g. `sqlite3 data/v2/monitor.sqlite "select * from proposals limit 10"`.
 
 ## Known limits (V2.1 work)
 
-- The event log only shows **accepted** proposals. Failed or reverted competing transactions are not visible yet; `transaction_attempts` is reserved for that.
+- Competition counts are a lower bound (see above). Attempts through bot contracts would need transaction tracing, which Alchemy's free plan doesn't include.
 - Whitelist reads show the *current* state, not the state at the historical block. Imported or backfilled history is compared against the latest default snapshot (`whitelist_basis = default`).
 - Legacy JSONL rows without `ancillaryData` can't be matched exactly to a request. They're grouped under `partial:` request keys, and `import` reports how many there are.
 - If old files have no contract address and their file name contains neither `managed` nor `standard`, those events are stored with contract `unknown`.
