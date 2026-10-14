@@ -1,0 +1,20 @@
+{
+  "name": "uma-monitor-v2",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Read-only UMA Optimistic Oracle V2 competition monitor for Polygon (Standard + Managed OOV2)",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "import": "node v2.mjs import",
+    "live": "node v2.mjs live",
+    "sync": "node v2.mjs sync",
+    "report": "node v2.mjs report",
+    "dashboard": "node v2.mjs dashboard"
+  },
+  "dependencies": {
+    "ethers": "^6.13.4"
+  }
+}
